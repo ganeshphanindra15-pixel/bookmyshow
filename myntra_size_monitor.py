@@ -1,6 +1,6 @@
 """
 BookMyShow Ticket Availability Monitor
-Monitors ET00455003 (Veerabhadrudu) in Hyderabad and notifies via Telegram.
+Checks if "Book Tickets" button is visible on the movie page.
 """
 
 import os
@@ -15,13 +15,11 @@ from datetime import datetime
 BOT_TOKEN  = os.environ.get("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 CHAT_ID    = os.environ.get("CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
 
-EVENT_CODE             = "ET00455003"
-REGION_CODE            = "HYD"
 CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "30"))
 # ──────────────────────────────────────────────────────────────────────────────
 
-MOVIE_URL = "https://in.bookmyshow.com/movies/hyderabad/veerabhadrudu/ET00455003"
-BMS_API   = "https://in.bookmyshow.com/api/movies-data/showtimes-by-event"
+MOVIE_URL  = "https://in.bookmyshow.com/movies/hyderabad/veerabhadrudu/ET00455003"
+MOVIE_NAME = "Veerabhadrudu"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,93 +30,74 @@ log = logging.getLogger(__name__)
 
 _last_notified_available = None
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-IN,en;q=0.9",
-    "Referer": "https://in.bookmyshow.com/",
-    "Origin": "https://in.bookmyshow.com",
-    "x-region-code": REGION_CODE,
-    "x-region-slug": "hyderabad",
-    "x-subregion-code": "",
-    "appCode": "MOBAND2",
-    "appVersion": "14.3.4",
-    "platform": "AND",
-}
+USER_AGENTS = [
+    "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; OnePlus 11) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+]
 
-def fetch_availability():
-    """Check BookMyShow API for show availability."""
+def get_headers():
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-IN,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": "https://in.bookmyshow.com/",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": "max-age=0",
+    }
+
+def fetch_page():
     session = requests.Session()
 
-    # Warm up with homepage visit
+    # Step 1: visit homepage to get cookies
     try:
         log.info("Warming up session...")
         session.get(
             "https://in.bookmyshow.com/",
-            headers={
-                "User-Agent": HEADERS["User-Agent"],
-                "Accept": "text/html",
-                "Accept-Language": "en-IN",
-            },
+            headers=get_headers(),
             timeout=15,
         )
-        time.sleep(random.uniform(1.5, 3.0))
+        time.sleep(random.uniform(2.0, 4.0))
     except Exception as e:
         log.warning("Warmup failed: " + str(e))
 
-    # Try multiple BMS API endpoints
-    endpoints = [
-        "https://in.bookmyshow.com/api/movies-data/showtimes-by-event?appCode=MOBAND2&appVersion=14.3.4&language=en&eventCode=" + EVENT_CODE + "&regionCode=" + REGION_CODE + "&subRegionCode=&bmsId=1.21.0&token=67x1xa33&lat=17.3850&lon=78.4867",
-        "https://in.bookmyshow.com/api/v2/movies/" + EVENT_CODE + "/showtimes?region=" + REGION_CODE,
-        "https://in.bookmyshow.com/serv/getData?cmd=GETDATES&type=MT&code=" + EVENT_CODE + "&region=" + REGION_CODE,
-    ]
-
-    for url in endpoints:
-        try:
-            log.info("Trying: " + url[:80] + "...")
-            r = session.get(url, headers=HEADERS, timeout=20)
-            log.info("Status: " + str(r.status_code) + " | Length: " + str(len(r.text)))
+    # Step 2: fetch the movie page
+    try:
+        log.info("Fetching movie page...")
+        r = session.get(MOVIE_URL, headers=get_headers(), timeout=20)
+        log.info("Status: " + str(r.status_code) + " | Length: " + str(len(r.text)))
+        if r.status_code == 200:
+            return r.text
+        else:
+            log.warning("Bad status: " + str(r.status_code))
             log.info("Preview: " + r.text[:300])
+    except Exception as e:
+        log.error("Fetch failed: " + str(e))
 
-            if r.status_code == 200 and len(r.text) > 50:
-                return r.text, r.status_code
-        except Exception as e:
-            log.warning("Failed: " + str(e))
+    return None
 
-    return None, None
+def is_booking_available(html):
+    if not html:
+        return False, "unknown"
 
+    text_lower = html.lower()
 
-def is_booking_available(response_text):
-    """Check if booking is open based on response content."""
-    if not response_text:
-        return False
+    # Strong positive signal
+    if "book tickets" in text_lower:
+        return True, "found 'book tickets'"
 
-    text_lower = response_text.lower()
+    # Negative signals
+    if "coming soon" in text_lower:
+        return False, "coming soon"
+    if "notify me" in text_lower:
+        return False, "notify me (not open yet)"
+    if "releasing on" in text_lower:
+        return False, "releasing on (future date)"
 
-    # Positive signals — booking is open
-    positive = [
-        "showtime", "cinemas", "venue", "screen",
-        "booktype", "sessionid", "shows", "theatres"
-    ]
-
-    # Negative signals — not yet open
-    negative = [
-        "no shows", "not available", "coming soon",
-        "notify me", "no showtimes", "currently unavailable"
-    ]
-
-    for word in negative:
-        if word in text_lower:
-            log.info("Negative signal found: " + word)
-            return False
-
-    for word in positive:
-        if word in text_lower:
-            log.info("Positive signal found: " + word)
-            return True
-
-    return False
-
+    return False, "no booking signals found"
 
 def send_telegram(message):
     url = "https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage"
@@ -133,42 +112,39 @@ def send_telegram(message):
     except Exception as e:
         log.error("Telegram error: " + str(e))
 
-
 def check_booking_availability():
     global _last_notified_available
 
-    log.info("Checking BookMyShow ticket availability for Veerabhadrudu in Hyderabad...")
-    response_text, status = fetch_availability()
+    log.info("Checking ticket availability for " + MOVIE_NAME + "...")
+    html = fetch_page()
 
-    if response_text is None:
-        log.warning("Could not fetch data, will retry next interval.")
+    if html is None:
+        log.warning("Could not fetch page, will retry next interval.")
         return
 
-    available = is_booking_available(response_text)
-    log.info("Booking available: " + str(available))
+    available, reason = is_booking_available(html)
+    log.info("Booking available: " + str(available) + " | Reason: " + reason)
 
     if available and _last_notified_available is not True:
         msg = (
-            "TICKETS ARE NOW AVAILABLE!\n\n"
-            "Veerabhadrudu - Hyderabad\n"
+            "BOOK TICKETS IS NOW AVAILABLE!\n\n"
+            + MOVIE_NAME + " - Hyderabad\n"
             "Book now: " + MOVIE_URL + "\n\n"
             "Checked at: " + datetime.now().strftime("%d %b %Y %I:%M %p")
         )
-        log.info("Sending message: " + msg)
         send_telegram(msg)
         _last_notified_available = True
 
     elif not available and _last_notified_available is True:
-        send_telegram("Veerabhadrudu tickets no longer available in Hyderabad.\nWill notify when they are back!")
+        send_telegram(MOVIE_NAME + " tickets no longer available.\nWill notify when they are back!")
         _last_notified_available = False
     else:
         log.info("No state change, skipping notification.")
 
-
 def main():
     log.info("==================================================")
     log.info("BookMyShow Monitor started")
-    log.info("Movie: Veerabhadrudu")
+    log.info("Movie: " + MOVIE_NAME)
     log.info("Region: Hyderabad")
     log.info("Interval: every " + str(CHECK_INTERVAL_MINUTES) + " minutes")
     log.info("==================================================")
@@ -179,7 +155,6 @@ def main():
     while True:
         schedule.run_pending()
         time.sleep(30)
-
 
 if __name__ == "__main__":
     main()
