@@ -1,13 +1,6 @@
 """
-Myntra Size Monitor - Telegram Bot
-Monitors product 28873290 for Size 9 availability and notifies via Telegram.
-
-Setup:
-1. pip install requests python-telegram-bot schedule
-2. Create a Telegram bot via @BotFather and get your BOT_TOKEN
-3. Get your CHAT_ID by messaging @userinfobot on Telegram
-4. Fill in BOT_TOKEN and CHAT_ID below
-5. Run: python myntra_size_monitor.py
+BookMyShow Ticket Availability Monitor
+Monitors ET00455003 (Veerabhadrudu) in Hyderabad and notifies via Telegram.
 """
 
 import os
@@ -15,151 +8,173 @@ import requests
 import schedule
 import time
 import logging
+import random
 from datetime import datetime
 
 # ─── CONFIGURATION ────────────────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-CHAT_ID   = os.environ.get("CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+CHAT_ID    = os.environ.get("CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
 
-PRODUCT_ID    = "28873290"
-TARGET_SIZE   = "9"
-CHECK_INTERVAL_MINUTES = 10             # How often to check (in minutes)
+EVENT_CODE             = "ET00455003"
+REGION_CODE            = "HYD"
+CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "30"))
 # ──────────────────────────────────────────────────────────────────────────────
 
-MYNTRA_API_URL = f"https://www.myntra.com/gateway/v2/product/{PRODUCT_ID}"
-PRODUCT_URL    = f"https://www.myntra.com/{PRODUCT_ID}"
+MOVIE_URL = "https://in.bookmyshow.com/movies/hyderabad/veerabhadrudu/ET00455003"
+BMS_API   = "https://in.bookmyshow.com/api/movies-data/showtimes-by-event"
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("monitor.log"),
-    ]
+    handlers=[logging.StreamHandler()],
 )
 log = logging.getLogger(__name__)
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json",
-    "Referer": "https://www.myntra.com/",
-}
-
-# Track last notification state to avoid spamming
 _last_notified_available = None
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-IN,en;q=0.9",
+    "Referer": "https://in.bookmyshow.com/",
+    "Origin": "https://in.bookmyshow.com",
+    "x-region-code": REGION_CODE,
+    "x-region-slug": "hyderabad",
+    "x-subregion-code": "",
+    "appCode": "MOBAND2",
+    "appVersion": "14.3.4",
+    "platform": "AND",
+}
 
-def send_telegram(message: str):
-    """Send a message via Telegram Bot API."""
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False,
-    }
+def fetch_availability():
+    """Check BookMyShow API for show availability."""
+    session = requests.Session()
+
+    # Warm up with homepage visit
     try:
-        r = requests.post(url, json=payload, timeout=10)
+        log.info("Warming up session...")
+        session.get(
+            "https://in.bookmyshow.com/",
+            headers={
+                "User-Agent": HEADERS["User-Agent"],
+                "Accept": "text/html",
+                "Accept-Language": "en-IN",
+            },
+            timeout=15,
+        )
+        time.sleep(random.uniform(1.5, 3.0))
+    except Exception as e:
+        log.warning("Warmup failed: " + str(e))
+
+    # Try multiple BMS API endpoints
+    endpoints = [
+        "https://in.bookmyshow.com/api/movies-data/showtimes-by-event?appCode=MOBAND2&appVersion=14.3.4&language=en&eventCode=" + EVENT_CODE + "&regionCode=" + REGION_CODE + "&subRegionCode=&bmsId=1.21.0&token=67x1xa33&lat=17.3850&lon=78.4867",
+        "https://in.bookmyshow.com/api/v2/movies/" + EVENT_CODE + "/showtimes?region=" + REGION_CODE,
+        "https://in.bookmyshow.com/serv/getData?cmd=GETDATES&type=MT&code=" + EVENT_CODE + "&region=" + REGION_CODE,
+    ]
+
+    for url in endpoints:
+        try:
+            log.info("Trying: " + url[:80] + "...")
+            r = session.get(url, headers=HEADERS, timeout=20)
+            log.info("Status: " + str(r.status_code) + " | Length: " + str(len(r.text)))
+            log.info("Preview: " + r.text[:300])
+
+            if r.status_code == 200 and len(r.text) > 50:
+                return r.text, r.status_code
+        except Exception as e:
+            log.warning("Failed: " + str(e))
+
+    return None, None
+
+
+def is_booking_available(response_text):
+    """Check if booking is open based on response content."""
+    if not response_text:
+        return False
+
+    text_lower = response_text.lower()
+
+    # Positive signals — booking is open
+    positive = [
+        "showtime", "cinemas", "venue", "screen",
+        "booktype", "sessionid", "shows", "theatres"
+    ]
+
+    # Negative signals — not yet open
+    negative = [
+        "no shows", "not available", "coming soon",
+        "notify me", "no showtimes", "currently unavailable"
+    ]
+
+    for word in negative:
+        if word in text_lower:
+            log.info("Negative signal found: " + word)
+            return False
+
+    for word in positive:
+        if word in text_lower:
+            log.info("Positive signal found: " + word)
+            return True
+
+    return False
+
+
+def send_telegram(message):
+    url = "https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage"
+    try:
+        r = requests.post(url, json={
+            "chat_id": CHAT_ID,
+            "text": message,
+            "disable_web_page_preview": True,
+        }, timeout=10)
         r.raise_for_status()
         log.info("Telegram notification sent.")
     except Exception as e:
-        log.error(f"Failed to send Telegram message: {e}")
+        log.error("Telegram error: " + str(e))
 
 
-def fetch_product_data() -> dict | None:
-    """Fetch product details from Myntra's internal API."""
-    try:
-        r = requests.get(MYNTRA_API_URL, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.HTTPError as e:
-        log.warning(f"HTTP error fetching product: {e}")
-    except Exception as e:
-        log.error(f"Error fetching product: {e}")
-    return None
-
-
-def check_size_availability():
-    """Main check: fetch product and look for size 9."""
+def check_booking_availability():
     global _last_notified_available
 
-    log.info(f"Checking size {TARGET_SIZE} availability for product {PRODUCT_ID}...")
-    data = fetch_product_data()
+    log.info("Checking BookMyShow ticket availability for Veerabhadrudu in Hyderabad...")
+    response_text, status = fetch_availability()
 
-    if not data:
-        log.warning("No data returned from Myntra API.")
+    if response_text is None:
+        log.warning("Could not fetch data, will retry next interval.")
         return
 
-    try:
-        # Navigate Myntra's response structure
-        product = data.get("style", data)  # some endpoints wrap in 'style'
-        name    = product.get("name", "Product")
-        sizes   = product.get("sizes", [])
+    available = is_booking_available(response_text)
+    log.info("Booking available: " + str(available))
 
-        # Each size entry looks like:
-        # { "label": "9", "available": true/false, "skuId": ... }
-        size_entry = None
-        for s in sizes:
-            label = str(s.get("label", "")).strip()
-            if label == TARGET_SIZE:
-                size_entry = s
-                break
+    if available and _last_notified_available is not True:
+        msg = (
+            "TICKETS ARE NOW AVAILABLE!\n\n"
+            "Veerabhadrudu - Hyderabad\n"
+            "Book now: " + MOVIE_URL + "\n\n"
+            "Checked at: " + datetime.now().strftime("%d %b %Y %I:%M %p")
+        )
+        log.info("Sending message: " + msg)
+        send_telegram(msg)
+        _last_notified_available = True
 
-        if size_entry is None:
-            log.info(f"Size {TARGET_SIZE} not listed for this product.")
-            if _last_notified_available is not False:
-                send_telegram(
-                    f"⚠️ <b>Size {TARGET_SIZE} not found</b> in the size chart for:\n"
-                    f"<b>{name}</b>\n{PRODUCT_URL}\n\n"
-                    f"It may not be offered in this size."
-                )
-                _last_notified_available = False
-            return
-
-        is_available = size_entry.get("available", False)
-        log.info(f"Size {TARGET_SIZE} available: {is_available}")
-
-        if is_available and _last_notified_available is not True:
-            send_telegram(
-                f"✅ <b>Size {TARGET_SIZE} is NOW AVAILABLE!</b>\n\n"
-                f"👟 <b>{name}</b>\n"
-                f"🛒 <a href='{PRODUCT_URL}'>Buy now on Myntra</a>\n\n"
-                f"⏰ Checked at: {datetime.now().strftime('%d %b %Y, %I:%M %p')}"
-            )
-            _last_notified_available = True
-
-        elif not is_available and _last_notified_available is True:
-            send_telegram(
-                f"❌ <b>Size {TARGET_SIZE} is no longer available</b>\n\n"
-                f"👟 <b>{name}</b>\n"
-                f"🔔 I'll keep watching and notify you when it's back!"
-            )
-            _last_notified_available = False
-
-        else:
-            log.info("No state change — skipping notification.")
-
-    except Exception as e:
-        log.error(f"Error parsing product data: {e}")
+    elif not available and _last_notified_available is True:
+        send_telegram("Veerabhadrudu tickets no longer available in Hyderabad.\nWill notify when they are back!")
+        _last_notified_available = False
+    else:
+        log.info("No state change, skipping notification.")
 
 
 def main():
-    log.info("=" * 50)
-    log.info("Myntra Size Monitor started")
-    log.info(f"Product : {PRODUCT_URL}")
-    log.info(f"Size    : {TARGET_SIZE}")
-    log.info(f"Interval: every {CHECK_INTERVAL_MINUTES} minutes")
-    log.info("=" * 50)
+    log.info("==================================================")
+    log.info("BookMyShow Monitor started")
+    log.info("Movie: Veerabhadrudu")
+    log.info("Region: Hyderabad")
+    log.info("Interval: every " + str(CHECK_INTERVAL_MINUTES) + " minutes")
+    log.info("==================================================")
 
-    # Run once immediately on start
-    check_size_availability()
-
-    # Schedule recurring checks
-    schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(check_size_availability)
+    check_booking_availability()
+    schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(check_booking_availability)
 
     while True:
         schedule.run_pending()
